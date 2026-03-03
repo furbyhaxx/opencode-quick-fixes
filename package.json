@@ -9,7 +9,8 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": ["dist", "src"],
+  
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.0.0"
   },
