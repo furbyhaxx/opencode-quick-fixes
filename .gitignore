@@ -1,0 +1,7 @@
+references/*/
+references/*
+references/opencode
+!references/AGENTS.md
+.opencode/
+!.opencode/plugins/gemini-thought-signature-fix.ts
+node_modules

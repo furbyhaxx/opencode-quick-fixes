@@ -1,0 +1,24 @@
+{
+  "name": "opencode-quick-fixes",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.2.15",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --format esm --target bun",
+    "typecheck": "tsc --noEmit"
+  }
+}
