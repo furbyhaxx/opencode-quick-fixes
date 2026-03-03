@@ -3,5 +3,6 @@ references/*
 references/opencode
 !references/AGENTS.md
 .opencode/
-!.opencode/plugins/gemini-thought-signature-fix.ts
+!.opencode/plugins/*
 node_modules
+!dist
