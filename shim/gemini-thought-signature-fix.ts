@@ -6,7 +6,8 @@
  *   1. On first run: download the latest built plugin from GitHub
  *   2. Cache it locally at ~/.cache/opencode-quick-fixes/index.js
  *   3. On subsequent runs: use the cached version (checks for updates every 24h)
- *   4. Re-export the plugin so OpenCode loads the global fetch interceptor
+ *   4. Validate the downloaded bundle is the expected v0.3+ shape
+ *   5. Re-export the plugin so OpenCode loads the global fetch interceptor
  *
  * No npm install required. No private registry. Just this one file.
  *
@@ -53,16 +54,52 @@ function writeMeta(meta: CacheMeta): void {
   writeFileSync(META_FILE, JSON.stringify(meta, null, 2))
 }
 
+function readCachedBundleSource(): string | null {
+  try {
+    return readFileSync(CACHE_FILE, "utf-8")
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Validate that a downloaded bundle has the expected v0.3+ architecture.
+ *
+ * We intentionally reject legacy v0.2 bundles that export GoogleFixPlugin /
+ * GoogleVertexFixPlugin because those use auth.loader fetch hooks and do not
+ * reliably fix google-vertex requests.
+ */
+function isCompatibleBundleSource(source: string): boolean {
+  const hasV3Export = source.includes("GeminiThoughtSignatureFix")
+  const hasGlobalFetchInterceptor = source.includes("globalThis.fetch")
+
+  const hasLegacyV2Exports =
+    source.includes("GoogleFixPlugin") ||
+    source.includes("GoogleVertexFixPlugin")
+
+  return hasV3Export && hasGlobalFetchInterceptor && !hasLegacyV2Exports
+}
+
 async function ensureCached(): Promise<string | null> {
   const meta = readMeta()
+  const hasCacheFile = existsSync(CACHE_FILE)
+  const cachedSource = readCachedBundleSource()
+  const hasCompatibleCache =
+    typeof cachedSource === "string" && isCompatibleBundleSource(cachedSource)
 
   // If we have a cache and checked recently, skip the network call
   if (
     meta &&
-    existsSync(CACHE_FILE) &&
+    hasCompatibleCache &&
     Date.now() - meta.lastCheck < UPDATE_INTERVAL_MS
   ) {
     return CACHE_FILE
+  }
+
+  if (hasCacheFile && !hasCompatibleCache) {
+    console.warn(
+      "[opencode-quick-fixes] Cached plugin is incompatible (likely v0.2). Attempting refresh.",
+    )
   }
 
   // Ensure cache dir exists
@@ -70,7 +107,7 @@ async function ensureCached(): Promise<string | null> {
 
   try {
     const headers: Record<string, string> = {}
-    if (meta?.etag && existsSync(CACHE_FILE)) {
+    if (meta?.etag && hasCacheFile) {
       headers["If-None-Match"] = meta.etag
     }
 
@@ -79,17 +116,37 @@ async function ensureCached(): Promise<string | null> {
     if (resp.status === 304) {
       // Not modified — update check timestamp only
       writeMeta({ lastCheck: Date.now(), etag: meta?.etag })
-      return CACHE_FILE
+      if (hasCompatibleCache) return CACHE_FILE
+
+      console.error(
+        "[opencode-quick-fixes] Remote bundle unchanged, but local cache is incompatible. Fix is not active.",
+      )
+      return null
     }
 
     if (!resp.ok) {
       console.error(
         `[opencode-quick-fixes] Failed to download plugin: HTTP ${resp.status}`,
       )
-      return existsSync(CACHE_FILE) ? CACHE_FILE : null
+      return hasCompatibleCache ? CACHE_FILE : null
     }
 
     const body = await resp.text()
+
+    if (!isCompatibleBundleSource(body)) {
+      console.error(
+        "[opencode-quick-fixes] Downloaded plugin failed compatibility checks (expected GeminiThoughtSignatureFix + global fetch interceptor).",
+      )
+
+      // Record this check so we still respect the update interval.
+      writeMeta({
+        lastCheck: Date.now(),
+        etag: resp.headers.get("etag") ?? meta?.etag ?? undefined,
+      })
+
+      return hasCompatibleCache ? CACHE_FILE : null
+    }
+
     writeFileSync(CACHE_FILE, body)
     writeMeta({
       lastCheck: Date.now(),
@@ -102,7 +159,7 @@ async function ensureCached(): Promise<string | null> {
       `[opencode-quick-fixes] Network error downloading plugin:`,
       err,
     )
-    return existsSync(CACHE_FILE) ? CACHE_FILE : null
+    return hasCompatibleCache ? CACHE_FILE : null
   }
 }
 
@@ -124,9 +181,26 @@ async function loadPlugin(): Promise<{
     return { GeminiThoughtSignatureFix: noop }
   }
 
-  const mod = await import(`file://${cachedPath}`)
+  const mod = (await import(`file://${cachedPath}`)) as {
+    GeminiThoughtSignatureFix?: unknown
+    GoogleFixPlugin?: unknown
+    GoogleVertexFixPlugin?: unknown
+  }
+
+  const hasLegacyExports =
+    typeof mod.GoogleFixPlugin === "function" ||
+    typeof mod.GoogleVertexFixPlugin === "function"
+
+  if (typeof mod.GeminiThoughtSignatureFix !== "function" || hasLegacyExports) {
+    console.error(
+      "[opencode-quick-fixes] Cached plugin exports are incompatible (legacy v0.2 shape). Gemini fix will NOT be active.",
+    )
+    const noop: Plugin = async () => ({})
+    return { GeminiThoughtSignatureFix: noop }
+  }
+
   return {
-    GeminiThoughtSignatureFix: mod.GeminiThoughtSignatureFix ?? mod.default,
+    GeminiThoughtSignatureFix: mod.GeminiThoughtSignatureFix as Plugin,
   }
 }
 
