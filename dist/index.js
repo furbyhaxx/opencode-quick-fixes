@@ -2,6 +2,7 @@
 // src/index.ts
 var SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 var MIN_SIGNATURE_LENGTH = 50;
+var PATCH_SENTINEL = "__thought_sig_patched";
 function toUrlString(input) {
   if (typeof input === "string")
     return input;
@@ -67,58 +68,52 @@ function fixThoughtSignatures(body) {
   }
   return patched;
 }
-function createPatchedFetch() {
-  return async function patchedFetch(input, init) {
+function installFetchInterceptor() {
+  const originalFetch = globalThis.fetch;
+  if (originalFetch[PATCH_SENTINEL]) {
+    return () => {};
+  }
+  async function patchedFetch(input, init) {
     if (!isGeminiGenerateContentRequest(input)) {
-      return fetch(input, init);
+      return originalFetch(input, init);
     }
     if (!init?.body || typeof init.body !== "string") {
-      return fetch(input, init);
+      return originalFetch(input, init);
     }
     let body;
     try {
       body = JSON.parse(init.body);
     } catch {
-      return fetch(input, init);
+      return originalFetch(input, init);
     }
     fixThoughtSignatures(body);
-    return fetch(input, {
+    return originalFetch(input, {
       ...init,
       body: JSON.stringify(body)
     });
+  }
+  patchedFetch[PATCH_SENTINEL] = true;
+  if ("preconnect" in originalFetch) {
+    patchedFetch.preconnect = originalFetch.preconnect;
+  }
+  globalThis.fetch = patchedFetch;
+  return () => {
+    globalThis.fetch = originalFetch;
   };
 }
-function createAuthHook(providerID) {
-  return {
-    provider: providerID,
-    methods: [],
-    loader: async (getAuth, _provider) => {
-      const auth = await getAuth();
-      const baseConfig = {};
-      if (auth && typeof auth === "object" && "apiKey" in auth) {
-        baseConfig.apiKey = auth.apiKey;
-      }
-      return {
-        ...baseConfig,
-        fetch: createPatchedFetch()
-      };
-    }
-  };
-}
-var GoogleFixPlugin = async (_ctx) => ({
-  auth: createAuthHook("google")
-});
-var GoogleVertexFixPlugin = async (_ctx) => ({
-  auth: createAuthHook("google-vertex")
-});
-var src_default = GoogleFixPlugin;
+var GeminiThoughtSignatureFix = async (_ctx) => {
+  installFetchInterceptor();
+  return {};
+};
+var src_default = GeminiThoughtSignatureFix;
 export {
   toUrlString,
   isGeminiGenerateContentRequest,
+  installFetchInterceptor,
   fixThoughtSignatures,
   src_default as default,
   SKIP_THOUGHT_SIGNATURE,
+  PATCH_SENTINEL,
   MIN_SIGNATURE_LENGTH,
-  GoogleVertexFixPlugin,
-  GoogleFixPlugin
+  GeminiThoughtSignatureFix
 };

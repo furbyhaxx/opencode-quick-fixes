@@ -6,7 +6,7 @@
  *   1. On first run: download the latest built plugin from GitHub
  *   2. Cache it locally at ~/.cache/opencode-quick-fixes/index.js
  *   3. On subsequent runs: use the cached version (checks for updates every 24h)
- *   4. Re-export all plugin symbols so OpenCode loads both google + google-vertex hooks
+ *   4. Re-export the plugin so OpenCode loads the global fetch interceptor
  *
  * No npm install required. No private registry. Just this one file.
  *
@@ -111,8 +111,7 @@ async function ensureCached(): Promise<string | null> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function loadPlugin(): Promise<{
-  GoogleFixPlugin: Plugin
-  GoogleVertexFixPlugin: Plugin
+  GeminiThoughtSignatureFix: Plugin
 }> {
   const cachedPath = await ensureCached()
 
@@ -122,17 +121,16 @@ async function loadPlugin(): Promise<{
         "Gemini thought signature fix will NOT be active.",
     )
     const noop: Plugin = async () => ({})
-    return { GoogleFixPlugin: noop, GoogleVertexFixPlugin: noop }
+    return { GeminiThoughtSignatureFix: noop }
   }
 
   const mod = await import(`file://${cachedPath}`)
   return {
-    GoogleFixPlugin: mod.GoogleFixPlugin,
-    GoogleVertexFixPlugin: mod.GoogleVertexFixPlugin,
+    GeminiThoughtSignatureFix: mod.GeminiThoughtSignatureFix ?? mod.default,
   }
 }
 
-const { GoogleFixPlugin, GoogleVertexFixPlugin } = await loadPlugin()
+const { GeminiThoughtSignatureFix } = await loadPlugin()
 
-export { GoogleFixPlugin, GoogleVertexFixPlugin }
-export default GoogleFixPlugin
+export { GeminiThoughtSignatureFix }
+export default GeminiThoughtSignatureFix

@@ -9,24 +9,25 @@
  *   content back to the API, but the signature can be missing or too short
  *   (< 50 chars).  The Gemini API then rejects the request with HTTP 400.
  *
- * Bug this fixes (v0.2.0):
- *   The original implementation only intercepted requests to the `google`
- *   provider and only matched `generativelanguage.googleapis.com` URLs.
- *   When using `google-vertex` (Vertex AI), requests go to
- *   `aiplatform.googleapis.com` instead — completely bypassing the fix.
- *   Additionally, when switching TO a Gemini model mid-session, historical
- *   tool-call parts from non-Gemini models (Claude, GPT) lack thought
- *   signatures entirely and were not being patched.
+ * v0.2.0 approach (auth.loader custom fetch — BROKEN for google-vertex):
+ *   Used `auth.loader` hooks returning `{ fetch: patchedFetch }` for both
+ *   `google` and `google-vertex` providers.  OpenCode's `getSDK()` explicitly
+ *   deletes `options.fetch` for the native Vertex AI SDK:
+ *     `if (providerID === "google-vertex" && ...) { delete options.fetch }`
+ *   This meant the patched fetch never reached the AI SDK for Vertex AI.
  *
- * Fix:
- *   - Intercepts BOTH `google` and `google-vertex` providers via separate
- *     auth hooks (OpenCode allows one auth.provider per plugin export).
- *   - Matches both `generativelanguage.googleapis.com` (Google AI) and
- *     `aiplatform.googleapis.com` (Vertex AI) endpoints.
- *   - Patches ALL `functionCall` parts regardless of origin model.
- *   - First `functionCall` per content block: inject sentinel if missing.
- *   - Subsequent (parallel) `functionCall` parts: remove signature entirely
- *     (the API rejects parallel calls that carry one).
+ * v0.3.0 approach (globalThis.fetch interceptor):
+ *   Replaces `globalThis.fetch` at plugin load time with a thin wrapper.
+ *   This is the ONLY interception point that survives OpenCode's fetch
+ *   deletion for google-vertex.
+ *
+ *   Safety:
+ *   - Bun's globalThis.fetch is writable and configurable
+ *   - AI SDK resolves fetch via lazy thunk `() => globalThis.fetch` at call time
+ *   - GoogleAuth uses gaxios → node-fetch, not globalThis.fetch (unaffected)
+ *   - URL filter ensures only Gemini generateContent requests are intercepted
+ *   - Chain-safe: captures originalFetch at install time
+ *   - Idempotent: sentinel property prevents double-install
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -40,6 +41,12 @@ export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 
 /** Signatures shorter than this are treated as absent/invalid. */
 export const MIN_SIGNATURE_LENGTH = 50
+
+/**
+ * Property name set on the wrapper function to prevent double-install.
+ * @internal
+ */
+export const PATCH_SENTINEL = "__thought_sig_patched"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // URL helpers
@@ -155,26 +162,39 @@ export function fixThoughtSignatures(body: Record<string, unknown>): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetch interceptor factory
+// Global fetch interceptor
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Creates a custom fetch function that intercepts Gemini API requests and
- * patches thought signatures on the wire.
+ * Replaces `globalThis.fetch` with a wrapper that intercepts Gemini API
+ * requests and patches thought signatures in the JSON request body.
+ *
+ * - Only intercepts URLs matching Gemini generateContent/streamGenerateContent
+ * - Chain-safe: captures the current globalThis.fetch at install time
+ * - Idempotent: re-calling is a no-op (uses PATCH_SENTINEL)
+ *
+ * @returns An uninstall function that restores the original fetch.
  */
-function createPatchedFetch() {
-  return async function patchedFetch(
+export function installFetchInterceptor(): () => void {
+  const originalFetch = globalThis.fetch
+
+  // Guard: already patched — don't double-wrap
+  if ((originalFetch as any)[PATCH_SENTINEL]) {
+    return () => {}
+  }
+
+  async function patchedFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
     // Pass through any non-Gemini request untouched.
     if (!isGeminiGenerateContentRequest(input)) {
-      return fetch(input, init)
+      return originalFetch(input, init)
     }
 
     // No body to fix -> forward as-is.
     if (!init?.body || typeof init.body !== "string") {
-      return fetch(input, init)
+      return originalFetch(input, init)
     }
 
     let body: Record<string, unknown>
@@ -182,74 +202,48 @@ function createPatchedFetch() {
       body = JSON.parse(init.body) as Record<string, unknown>
     } catch {
       // Unparseable body — don't touch it.
-      return fetch(input, init)
+      return originalFetch(input, init)
     }
 
     // Apply the thought_signature fix in-place.
     fixThoughtSignatures(body)
 
-    return fetch(input, {
+    return originalFetch(input, {
       ...init,
       body: JSON.stringify(body),
     })
   }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auth hook factory
-// ─────────────────────────────────────────────────────────────────────────────
+  // Mark as patched so double-install is a no-op
+  ;(patchedFetch as any)[PATCH_SENTINEL] = true
 
-/**
- * Creates an auth hook for a specific provider that injects the patched fetch.
- *
- * `methods: []` means no new login UI — we piggyback on existing auth and
- * only intercept the outbound fetch.
- */
-function createAuthHook(providerID: string) {
-  return {
-    provider: providerID,
-    methods: [] as never[],
+  // Bun's typeof fetch includes a static `preconnect` method — carry it over
+  // so the type signature stays compatible.
+  if ("preconnect" in originalFetch) {
+    ;(patchedFetch as any).preconnect = (originalFetch as any).preconnect
+  }
 
-    loader: async (
-      getAuth: () => Promise<Record<string, unknown> | undefined>,
-      _provider: unknown,
-    ) => {
-      const auth = await getAuth()
+  globalThis.fetch = patchedFetch as typeof fetch
 
-      const baseConfig: Record<string, unknown> = {}
-      if (auth && typeof auth === "object" && "apiKey" in auth) {
-        baseConfig.apiKey = (auth as { apiKey: string }).apiKey
-      }
-
-      return {
-        ...baseConfig,
-        fetch: createPatchedFetch(),
-      }
-    },
+  // Return uninstall function (useful for tests)
+  return () => {
+    globalThis.fetch = originalFetch
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plugin exports
-//
-// OpenCode allows one `auth.provider` per plugin export. To cover both
-// `google` (Google AI) and `google-vertex` (Vertex AI) we export two
-// separate Plugin instances. OpenCode deduplicates by function reference —
-// since these are different functions, both will be initialized.
+// Plugin export
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Fixes thought signatures for the `google` (Google AI) provider. */
-export const GoogleFixPlugin: Plugin = async (_ctx) => ({
-  auth: createAuthHook("google"),
-})
-
-/** Fixes thought signatures for the `google-vertex` (Vertex AI) provider. */
-export const GoogleVertexFixPlugin: Plugin = async (_ctx) => ({
-  auth: createAuthHook("google-vertex"),
-})
-
 /**
- * Default export — covers the `google` provider.
- * Named exports `GoogleFixPlugin` and `GoogleVertexFixPlugin` cover both.
+ * OpenCode plugin that fixes Gemini thought_signature errors.
+ *
+ * Installs a global fetch interceptor at load time. Returns empty hooks —
+ * all work is done at the fetch level, below the plugin hook system.
  */
-export default GoogleFixPlugin
+export const GeminiThoughtSignatureFix: Plugin = async (_ctx) => {
+  installFetchInterceptor()
+  return {}
+}
+
+export default GeminiThoughtSignatureFix

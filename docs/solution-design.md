@@ -1,168 +1,149 @@
 # Solution Design: Gemini Thought Signature Fix Plugin
 
-> **Update (v0.2.0):** This document's earlier message-level approach is historical.
-> The implemented architecture now uses a wire-level `auth.loader` custom `fetch()`
-> interceptor for both `google` and `google-vertex`, patching raw HTTP request bodies
-> before they reach Gemini APIs.
+> **Update (v0.3.0):** The architecture now uses a global `fetch` interceptor.
+> v0.2.0's `auth.loader` custom fetch approach was broken for `google-vertex` because
+> OpenCode strips `options.fetch` before creating the native Vertex SDK client.
 
-## Approach Evaluation
+## Root Cause
 
-### Option A: `experimental.chat.messages.transform` Hook (Message-Level Fix)
+Gemini expects `thoughtSignature` on certain replayed `functionCall` parts. In long
+multi-model sessions (Claude/GPT tool calls replayed to Gemini), requests can contain
+missing or too-short signatures and fail with HTTP 400.
 
-**Concept**: Intercept messages before they're converted to model messages. Ensure
-reasoning parts have proper `metadata` with thought signatures.
+v0.2.0 attempted to patch the request body via auth hook custom fetch:
 
-**Pros**:
-- Runs early in the pipeline (before `toModelMessages()`)
-- Can fix missing metadata on reasoning/tool parts
-- Works at the OpenCode internal message level
-
-**Cons**:
-- The `experimental.chat.messages.transform` hook receives `MessageV2.WithParts[]` which
-  are OpenCode's internal format — the `metadata` field is an opaque blob stored in the DB
-- We cannot easily inject a valid `thoughtSignature` into this blob without knowing the
-  exact schema `@ai-sdk/google` expects
-- The `differentModel` check in `toModelMessages()` runs AFTER this hook, so metadata we
-  fix could still be stripped
-- **Verdict**: Insufficient — the stripping happens downstream
-
-### Option B: `chat.params` Hook (Provider Options Fix)
-
-**Concept**: Modify provider options to disable thinking, preventing thought signatures
-from being needed.
-
-**Pros**:
-- Simple one-liner: `output.options.thinkingConfig = { includeThoughts: false }`
-- Eliminates the root cause entirely
-
-**Cons**:
-- **Disables thinking entirely** — major quality degradation for reasoning tasks
-- Gemini 3 models are designed to use thinking; disabling it removes their key advantage
-- **Verdict**: Too aggressive — unacceptable quality loss
-
-### Option C: `experimental.chat.messages.transform` + Metadata Injection (Hybrid)
-
-**Concept**: In the messages transform hook, detect Gemini models and ensure all reasoning
-parts and tool parts have metadata containing the `skip_thought_signature_validator` sentinel.
-
-**Pros**:
-- Uses Google's official validator-skip mechanism
-- Preserves thinking/reasoning output
-- Minimal quality degradation (model still thinks, just can't restore from checkpoint)
-- Works regardless of `differentModel` check — we inject metadata on ALL parts
-
-**Cons**:
-- Some reasoning quality degradation in multi-step tool chains
-- Relies on undocumented Google sentinel string
-- Need to match the exact metadata schema `@ai-sdk/google` expects
-
-**Verdict**: Best balance — chosen approach.
-
-### Option D: Custom Middleware (Not Available via Plugin API)
-
-**Concept**: Inject AI SDK middleware to transform messages at the wire level.
-
-**Cons**: Not exposed through plugin hooks.
-
----
-
-## Chosen Approach: Option C — Metadata Injection with Validator Skip
-
-### Architecture
-
-```
-Plugin Load
-  ↓
-Detect Gemini model in chat.params (cache model info)
-  ↓
-experimental.chat.messages.transform fires
-  ↓
-For each assistant message:
-  - For each reasoning part: ensure metadata has google.thoughtSignature
-  - For each tool part: ensure metadata has google.thoughtSignature  
-  ↓
-toModelMessages() runs — metadata is now present
-  ↓
-@ai-sdk/google serializes thoughtSignature into wire format
-  ↓
-Gemini API accepts the request
+```typescript
+auth.loader -> return { fetch: patchedFetch }
 ```
 
-### Model Detection
+But OpenCode's `getSDK()` has this guard for native Vertex models:
 
-Must work with any Gemini model naming pattern:
-
-```ts
-function isGeminiModel(model: { providerID: string; modelID: string } | undefined): boolean {
-  if (!model) return false
-  const id = `${model.providerID}/${model.modelID}`.toLowerCase()
-  return id.includes("gemini")
+```typescript
+if (providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
+  delete options.fetch
 }
 ```
 
-This matches:
-- `google/gemini-3.1-pro-preview`
-- `opencode/gemini-3.1-pro`
-- `google-vertex/gemini-3-flash`
-- `custom-provider/gemini-3-pro-latest`
-- `openrouter/google/gemini-3.1-pro`
+So for `google-vertex`, the plugin fetch was never used.
 
-### Metadata Schema
+## Evaluated Surfaces
 
-The `@ai-sdk/google` package expects `providerMetadata` on reasoning parts to contain:
+### 1) `experimental.chat.messages.transform`
 
-```ts
-{
-  google: {
-    thought: true,
-    thoughtSignature: "<string>"
-  }
-}
+- Fires before `toModelMessages()`
+- Input is internal `MessageV2.WithParts[]`
+- `toModelMessages()` runs later and strips provider metadata for `differentModel`
+- Primary failure case is cross-model replay, so this surface cannot guarantee signatures
+
+**Verdict:** Not reliable.
+
+### 2) `chat.params`
+
+- Output shape is `{ temperature, topP, topK, options }`
+- No message array is exposed
+- Cannot patch per-part `providerOptions.google.thoughtSignature`
+
+**Verdict:** Cannot solve the bug.
+
+### 3) `auth.loader` custom fetch (v0.2.0)
+
+- Works for `google`
+- Broken for native `google-vertex` due to `delete options.fetch`
+
+**Verdict:** Incomplete.
+
+### 4) Global `globalThis.fetch` interceptor (chosen)
+
+- Sits below OpenCode provider option mutation
+- Survives `delete options.fetch`
+- Intercepts final wire payload for both Google AI and Vertex AI
+
+**Verdict:** Only robust interception point.
+
+## Chosen Architecture (v0.3.0)
+
+At plugin load, replace `globalThis.fetch` with a wrapper that:
+1. URL-filters to Gemini generateContent endpoints only
+2. Parses JSON body
+3. Runs `fixThoughtSignatures()`
+4. Re-serializes and forwards to captured `originalFetch`
+
+```
+OpenCode / AI SDK request
+         ↓
+globalThis.fetch wrapper
+         ↓
+URL matches Gemini generateContent?
+  ├─ no  -> pass through untouched
+  └─ yes -> parse body, patch thought signatures, forward
 ```
 
-And `callProviderMetadata` on tool parts:
+## Integration Points
 
-```ts
-{
-  google: {
-    thoughtSignature: "<string>"
-  }
-}
-```
+### APIs and paths
 
-### Sentinel Value
+- Intercepted hosts:
+  - `generativelanguage.googleapis.com`
+  - `aiplatform.googleapis.com`
+- Intercepted methods by URL suffix:
+  - `generateContent`
+  - `streamGenerateContent`
 
-We use `"skip_thought_signature_validator"` as documented in OpenCode issue #4832 and
-confirmed in Google's Gemini API documentation for cases where signatures cannot be preserved.
+### Core function behavior (`fixThoughtSignatures`)
 
-### Hook Implementation
+Per content block:
+- First `functionCall`:
+  - keep valid signature (`>= 50 chars`)
+  - otherwise set sentinel `skip_thought_signature_validator`
+- Subsequent (parallel) `functionCall` parts:
+  - remove `thoughtSignature` / `thought_signature`
 
-The plugin uses `experimental.chat.messages.transform` to walk all messages and inject
-the sentinel signature where metadata is missing or incomplete.
+### Plugin export surface
 
-Additionally, it uses `chat.params` to detect the current model and store it for the
-messages transform hook (which doesn't receive model info directly).
+- Single export: `GeminiThoughtSignatureFix`
+- `default` export points to the same function
+- Returns `{}` hooks; logic runs at load time via interceptor install
 
-### Edge Cases Handled
+## Safety Analysis
 
-1. **Model switching**: Always injects metadata regardless of whether model matches
-2. **Missing metadata entirely**: Creates the full metadata structure
-3. **Partial metadata**: Preserves existing metadata, only fills in missing signatures
-4. **Non-Gemini models**: No-op — skips entirely
-5. **Compacted messages**: Still injects metadata even if tool output was cleared
-6. **Already valid signatures**: Preserves existing valid signatures (only injects if missing)
+- **Bun compatibility:** `globalThis.fetch` is writable/configurable
+- **Late binding:** AI SDK resolves fallback fetch from `globalThis.fetch` at call time
+- **GoogleAuth unaffected:** Vertex token fetch uses gaxios/node-fetch (not global fetch)
+- **MCP unaffected:** URL filter excludes MCP endpoints
+- **Other providers unaffected:** non-Gemini URLs pass through untouched
+- **Chain-safe:** captures current `originalFetch`; works with other wrappers
+- **Idempotent:** sentinel `__thought_sig_patched` prevents double-install
 
----
+## Verification Strategy
 
-## Quality Impact Assessment
+### Unit tests
 
-| Aspect | Impact |
-|---|---|
-| Thinking/reasoning output | **Preserved** — model still thinks, output visible |
-| Tool calling | **Fixed** — no more 400 errors |
-| Reasoning continuity | **Minor degradation** — model can't fully restore chain-of-thought across tool calls |
-| Simple tasks | **No impact** — most tasks don't depend on thought continuity |
-| Complex multi-step chains | **Slight degradation** — model may repeat some reasoning steps |
+- URL matcher coverage (Google AI + Vertex + negatives)
+- Signature patching coverage (missing, short, valid, parallel, mixed content)
+- Interceptor coverage:
+  - patches Gemini requests
+  - passes through non-Gemini
+  - handles non-string bodies
+  - handles malformed JSON
+  - idempotent install
+  - uninstall restores original fetch
 
-The trade-off is acceptable: a slight degradation in multi-step reasoning continuity
-is vastly preferable to unrecoverable session crashes.
+### Build/Type checks
+
+- `bun run test`
+- `bun run typecheck`
+- `bun run build`
+
+### Dist artifact checks
+
+- Dist includes `installFetchInterceptor`
+- Dist includes sentinel `__thought_sig_patched`
+- Dist no longer contains old auth hook factories
+
+## Trade-offs
+
+- Global interception is broader than provider-local hooks, but URL filtering keeps it narrow
+- Small per-request overhead (string checks), JSON parse/stringify only on matching Gemini calls
+- Preserves reasoning features (does not disable thinking)
+
+This trade-off is preferred over unrecoverable session failures.

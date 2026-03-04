@@ -1,12 +1,13 @@
-import { describe, expect, it } from "bun:test"
+import { afterEach, describe, expect, it } from "bun:test"
 import {
   fixThoughtSignatures,
   isGeminiGenerateContentRequest,
   toUrlString,
+  installFetchInterceptor,
+  GeminiThoughtSignatureFix,
   SKIP_THOUGHT_SIGNATURE,
   MIN_SIGNATURE_LENGTH,
-  GoogleFixPlugin,
-  GoogleVertexFixPlugin,
+  PATCH_SENTINEL,
 } from "./index"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,10 +397,10 @@ describe("fixThoughtSignatures", () => {
 
       const contents = body.contents as any[]
 
-      // Content block 1 (user) — no functionCall, untouched
+      // Content block 0 (user) — no functionCall, untouched
       expect(contents[0].parts[0].text).toBe("Help me with X")
 
-      // Content block 2 (model with single tool call from Claude)
+      // Content block 1 (model with single tool call from Claude)
       expect(contents[1].parts[0].text).toBe("Let me read that file")
       expect(contents[1].parts[1].thought_signature).toBe(
         SKIP_THOUGHT_SIGNATURE,
@@ -408,9 +409,9 @@ describe("fixThoughtSignatures", () => {
         SKIP_THOUGHT_SIGNATURE,
       )
 
-      // Content block 3 (tool result) — no functionCall, untouched
+      // Content block 2 (tool result) — no functionCall, untouched
 
-      // Content block 4 (model with parallel tool calls from GPT)
+      // Content block 3 (model with parallel tool calls from GPT)
       // First tool call: sentinel
       expect(contents[3].parts[1].thought_signature).toBe(
         SKIP_THOUGHT_SIGNATURE,
@@ -541,31 +542,223 @@ describe("fixThoughtSignatures", () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plugin structure
+// installFetchInterceptor
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Plugin exports", () => {
-  it("GoogleFixPlugin targets 'google' provider", async () => {
-    const hooks = await GoogleFixPlugin({} as any)
-    expect(hooks.auth).toBeDefined()
-    expect(hooks.auth!.provider).toBe("google")
-    expect(hooks.auth!.methods).toEqual([])
+describe("installFetchInterceptor", () => {
+  let uninstall: (() => void) | undefined
+
+  afterEach(() => {
+    // Always restore the original fetch after each test
+    if (uninstall) {
+      uninstall()
+      uninstall = undefined
+    }
   })
 
-  it("GoogleVertexFixPlugin targets 'google-vertex' provider", async () => {
-    const hooks = await GoogleVertexFixPlugin({} as any)
-    expect(hooks.auth).toBeDefined()
-    expect(hooks.auth!.provider).toBe("google-vertex")
-    expect(hooks.auth!.methods).toEqual([])
+  it("replaces globalThis.fetch with a patched version", () => {
+    const before = globalThis.fetch
+    uninstall = installFetchInterceptor()
+    expect(globalThis.fetch).not.toBe(before)
+    expect((globalThis.fetch as any)[PATCH_SENTINEL]).toBe(true)
   })
 
-  it("default export is GoogleFixPlugin (not GoogleVertexFixPlugin)", async () => {
+  it("uninstall restores the original fetch", () => {
+    const before = globalThis.fetch
+    uninstall = installFetchInterceptor()
+    expect(globalThis.fetch).not.toBe(before)
+    uninstall()
+    uninstall = undefined
+    expect(globalThis.fetch).toBe(before)
+  })
+
+  it("is idempotent — calling twice does not double-wrap", () => {
+    uninstall = installFetchInterceptor()
+    const afterFirst = globalThis.fetch
+
+    const secondUninstall = installFetchInterceptor()
+    expect(globalThis.fetch).toBe(afterFirst) // same reference
+    secondUninstall() // should be a no-op
+    expect(globalThis.fetch).toBe(afterFirst) // still patched
+  })
+
+  it("intercepts Gemini generateContent and patches the body", async () => {
+    // Set up a mock original fetch that captures what it receives
+    let capturedBody: string | undefined
+    const mockFetch = async (input: any, init: any) => {
+      capturedBody = init?.body
+      return new Response("ok", { status: 200 })
+    }
+    if ("preconnect" in globalThis.fetch) {
+      ;(mockFetch as any).preconnect = (globalThis.fetch as any).preconnect
+    }
+    globalThis.fetch = mockFetch as typeof fetch
+
+    uninstall = installFetchInterceptor()
+
+    const body = JSON.stringify({
+      contents: [
+        {
+          role: "model",
+          parts: [{ functionCall: { name: "test", args: {} } }],
+        },
+      ],
+    })
+
+    await globalThis.fetch(
+      "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/l/publishers/google/models/gemini-3:streamGenerateContent?alt=sse",
+      { method: "POST", body },
+    )
+
+    expect(capturedBody).toBeDefined()
+    const parsed = JSON.parse(capturedBody!)
+    expect(parsed.contents[0].parts[0].thoughtSignature).toBe(
+      SKIP_THOUGHT_SIGNATURE,
+    )
+    expect(parsed.contents[0].parts[0].thought_signature).toBe(
+      SKIP_THOUGHT_SIGNATURE,
+    )
+  })
+
+  it("passes through non-Gemini requests unmodified", async () => {
+    let capturedBody: string | undefined
+    const mockFetch = async (_input: any, init: any) => {
+      capturedBody = init?.body
+      return new Response("ok", { status: 200 })
+    }
+    if ("preconnect" in globalThis.fetch) {
+      ;(mockFetch as any).preconnect = (globalThis.fetch as any).preconnect
+    }
+    globalThis.fetch = mockFetch as typeof fetch
+
+    uninstall = installFetchInterceptor()
+
+    const body = JSON.stringify({ contents: [{ parts: [{ functionCall: { name: "x", args: {} } }] }] })
+
+    await globalThis.fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      body,
+    })
+
+    // Body should be passed through unchanged (no patching)
+    expect(capturedBody).toBe(body)
+  })
+
+  it("passes through requests with non-string body", async () => {
+    let capturedInit: any
+    const mockFetch = async (_input: any, init: any) => {
+      capturedInit = init
+      return new Response("ok", { status: 200 })
+    }
+    if ("preconnect" in globalThis.fetch) {
+      ;(mockFetch as any).preconnect = (globalThis.fetch as any).preconnect
+    }
+    globalThis.fetch = mockFetch as typeof fetch
+
+    uninstall = installFetchInterceptor()
+
+    const binaryBody = new Uint8Array([1, 2, 3])
+
+    await globalThis.fetch(
+      "https://aiplatform.googleapis.com/v1/models/gemini:streamGenerateContent",
+      { method: "POST", body: binaryBody },
+    )
+
+    // Should pass through unmodified
+    expect(capturedInit.body).toBe(binaryBody)
+  })
+
+  it("passes through requests with unparseable JSON body", async () => {
+    let capturedBody: string | undefined
+    const mockFetch = async (_input: any, init: any) => {
+      capturedBody = init?.body
+      return new Response("ok", { status: 200 })
+    }
+    if ("preconnect" in globalThis.fetch) {
+      ;(mockFetch as any).preconnect = (globalThis.fetch as any).preconnect
+    }
+    globalThis.fetch = mockFetch as typeof fetch
+
+    uninstall = installFetchInterceptor()
+
+    const malformed = "not-json{{"
+
+    await globalThis.fetch(
+      "https://generativelanguage.googleapis.com/v1/models/gemini:generateContent",
+      { method: "POST", body: malformed },
+    )
+
+    expect(capturedBody).toBe(malformed) // unchanged
+  })
+
+  it("intercepts Google AI (generativelanguage) requests too", async () => {
+    let capturedBody: string | undefined
+    const mockFetch = async (_input: any, init: any) => {
+      capturedBody = init?.body
+      return new Response("ok", { status: 200 })
+    }
+    if ("preconnect" in globalThis.fetch) {
+      ;(mockFetch as any).preconnect = (globalThis.fetch as any).preconnect
+    }
+    globalThis.fetch = mockFetch as typeof fetch
+
+    uninstall = installFetchInterceptor()
+
+    const body = JSON.stringify({
+      contents: [
+        {
+          role: "model",
+          parts: [{ functionCall: { name: "test", args: {} } }],
+        },
+      ],
+    })
+
+    await globalThis.fetch(
+      "https://generativelanguage.googleapis.com/v1/models/gemini-3-pro:generateContent",
+      { method: "POST", body },
+    )
+
+    const parsed = JSON.parse(capturedBody!)
+    expect(parsed.contents[0].parts[0].thoughtSignature).toBe(
+      SKIP_THOUGHT_SIGNATURE,
+    )
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin export
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Plugin export", () => {
+  let uninstall: (() => void) | undefined
+
+  afterEach(() => {
+    if (uninstall) {
+      uninstall()
+      uninstall = undefined
+    }
+  })
+
+  it("default export is GeminiThoughtSignatureFix", async () => {
     const { default: defaultExport } = await import("./index")
-    expect(defaultExport).toBe(GoogleFixPlugin)
+    expect(defaultExport).toBe(GeminiThoughtSignatureFix)
   })
 
-  it("GoogleFixPlugin and GoogleVertexFixPlugin are different functions", () => {
-    // Important: OpenCode deduplicates by reference, so these must be different
-    expect(GoogleFixPlugin).not.toBe(GoogleVertexFixPlugin)
+  it("plugin installs the fetch interceptor and returns empty hooks", async () => {
+    const originalFetch = globalThis.fetch
+
+    const hooks = await GeminiThoughtSignatureFix({} as any)
+
+    // Fetch should now be patched
+    expect((globalThis.fetch as any)[PATCH_SENTINEL]).toBe(true)
+    expect(globalThis.fetch).not.toBe(originalFetch)
+
+    // Hooks should be empty (all work is done at the fetch level)
+    expect(hooks).toEqual({})
+
+    // Cleanup: restore original
+    uninstall = () => {
+      globalThis.fetch = originalFetch
+    }
   })
 })
