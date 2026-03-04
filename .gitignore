@@ -2,7 +2,9 @@ references/*/
 references/*
 references/opencode
 !references/AGENTS.md
-.opencode/
-!.opencode/plugins/*
+
+# Ignore .opencode internals but keep plugins
+.opencode/*
+!.opencode/plugins/
+
 node_modules
-!dist

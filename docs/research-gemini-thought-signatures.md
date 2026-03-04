@@ -1,5 +1,9 @@
 # Gemini Thought Signature Error: Research & Analysis
 
+> **Update (v0.2.0):** The production fix in this repository now intercepts
+> wire-level HTTP requests for both Google AI and Vertex AI providers, which
+> avoids message-level edge cases during model switching.
+
 ## Problem Statement
 
 Gemini 3.x models (3 Pro, 3 Flash, 3.1 Pro, 3.1 Flash) enforce mandatory `thought_signature`

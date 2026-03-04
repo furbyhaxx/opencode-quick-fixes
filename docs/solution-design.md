@@ -1,5 +1,10 @@
 # Solution Design: Gemini Thought Signature Fix Plugin
 
+> **Update (v0.2.0):** This document's earlier message-level approach is historical.
+> The implemented architecture now uses a wire-level `auth.loader` custom `fetch()`
+> interceptor for both `google` and `google-vertex`, patching raw HTTP request bodies
+> before they reach Gemini APIs.
+
 ## Approach Evaluation
 
 ### Option A: `experimental.chat.messages.transform` Hook (Message-Level Fix)

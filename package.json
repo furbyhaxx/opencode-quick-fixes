@@ -1,6 +1,6 @@
 {
   "name": "opencode-quick-fixes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -10,16 +10,18 @@
     }
   },
   "files": ["dist", "src"],
-  
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.0.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.2.15",
+    "@types/bun": "^1.3.10",
     "typescript": "^5.9.3"
   },
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --format esm --target bun",
-    "typecheck": "tsc --noEmit"
+    "test": "bun test src/index.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublish": "bun run typecheck && bun run test && bun run build"
   }
 }
